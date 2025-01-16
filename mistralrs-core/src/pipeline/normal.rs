@@ -280,7 +280,7 @@ impl Loader for NormalLoader {
         let config = std::fs::read_to_string(paths.get_config_filename())?;
 
         // If auto, convert to Map
-        if let DeviceMapSetting::Auto = mapper.clone() {
+        if let DeviceMapSetting::Auto(params) = mapper.clone() {
             let devices = device_map::get_all_similar_devices(device)?;
             // Initial dtype
             let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
@@ -348,6 +348,7 @@ impl Loader for NormalLoader {
                         layer_sizes_sum + non_mapped_size_in_bytes,
                     )
                 };
+
             let new = self.inner.get_device_layers(
                 &config,
                 self.inner.num_layers(&config)?,
@@ -355,6 +356,8 @@ impl Loader for NormalLoader {
                 non_mapped_size_in_bytes,
                 total_model_size_in_bytes,
                 &devices,
+                dtype,
+                &params,
             )?;
             mapper = DeviceMapSetting::Map(new);
         }

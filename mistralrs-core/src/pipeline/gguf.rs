@@ -43,7 +43,7 @@ use crate::{
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
 use anyhow::{bail, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use either::Either;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
@@ -362,14 +362,15 @@ impl Loader for GGUFLoader {
 
         // If auto, convert to Map
         let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
-        if let DeviceMapSetting::Auto = mapper.clone() {
+        if let DeviceMapSetting::Auto(params) = mapper.clone() {
             let devices = device_map::get_all_similar_devices(device)?;
+            // Initial dtype
+            let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
 
             let model = GgufDeviceMapLoaderInner {
                 model: &model,
                 arch,
             };
-            let dtype = DType::F32;
 
             let layer_sizes_in_bytes =
                 model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1)?;
@@ -385,6 +386,8 @@ impl Loader for GGUFLoader {
                 non_mapped_size_in_bytes,
                 total_model_size_in_bytes,
                 &devices,
+                dtype,
+                &params,
             )?;
             mapper = DeviceMapSetting::Map(new);
         }
@@ -433,7 +436,7 @@ impl Loader for GGUFLoader {
         };
 
         let model_config_metadata: ContentConfig = (&model).into();
-        let internal_dtype = dtype.try_into_dtype(&[device]).unwrap();
+        let internal_dtype = mapper.get_min_dtype(dtype)?;
 
         let model_config = {
             // Base config (quantization only):

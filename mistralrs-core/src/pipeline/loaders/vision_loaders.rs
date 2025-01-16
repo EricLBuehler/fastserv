@@ -18,6 +18,7 @@ use crate::device_map::DeviceMapper;
 use crate::layers::Conv3dConfig;
 use crate::paged_attention::{AttentionImplementation, ModelConfigMetadata};
 use crate::pipeline::isq::IsqModelLoader;
+use crate::pipeline::loaders::AutoDeviceMapParams;
 use crate::pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata};
 use crate::pipeline::{EitherCache, IsqModel, Processor, ProcessorCreator, VisionPromptPrefixer};
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
@@ -27,9 +28,9 @@ use crate::vision_models::idefics2_input_processor::Idefics2Processor;
 use crate::vision_models::idefics3::{Idefics3Config, Idefics3Model, Idefics3Processor};
 use crate::vision_models::llava::config::Config as LLaVAConfig;
 use crate::vision_models::llava15::Model as LLaVA;
-use crate::vision_models::llava_inputs_processor::LLaVAProcessor;
+use crate::vision_models::llava_inputs_processor::{self, LLaVAProcessor};
 use crate::vision_models::llava_next::Model as LLaVANext;
-use crate::vision_models::llava_next_inputs_processor::LLaVANextProcessor;
+use crate::vision_models::llava_next_inputs_processor::{self, LLaVANextProcessor};
 use crate::vision_models::mllama::{MLlamaConfig, MLlamaModel, MLlamaProcessor};
 use crate::vision_models::phi3::{Config as Phi3Config, Model as Phi3, PHI3V_CLIP_CONFIG};
 use crate::vision_models::phi3_inputs_processor::Phi3Processor;
@@ -279,6 +280,68 @@ impl IsqModelLoader for Phi3VLoader {
 }
 
 impl DeviceMappedModelLoader for Phi3VLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        // NOTE: we ignore max_num_images although it can only be one...
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Phi3Config = serde_json::from_str(config)?;
+
+        let vcfg = &PHI3V_CLIP_CONFIG;
+
+        let num_patches = (vcfg.image_size / vcfg.patch_size).pow(2);
+        let img_seq_len = (num_patches + 1) * max_num_images;
+
+        let max_text_attn = {
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        // NOTE: we ignore max_num_images although it can only be one...
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Phi3Config = serde_json::from_str(config)?;
+
+        let vcfg = &PHI3V_CLIP_CONFIG;
+
+        let num_patches = (vcfg.image_size / vcfg.patch_size).pow(2);
+        let img_seq_len = num_patches + 1;
+
+        let max_vision_attn = {
+            (max_batch_size * max_num_images) * cfg.num_attention_heads * img_seq_len * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -471,6 +534,68 @@ impl IsqModelLoader for Idefics2Loader {
 }
 
 impl DeviceMappedModelLoader for Idefics2Loader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Idefics2Config = serde_json::from_str(config)?;
+
+        let num_patches = (cfg.vision_config.image_size / cfg.vision_config.patch_size).pow(2);
+        let img_seq_len = (num_patches + 1) * max_num_images;
+
+        let max_text_attn = {
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+            max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Idefics2Config = serde_json::from_str(config)?;
+
+        let num_patches = (cfg.vision_config.image_size / cfg.vision_config.patch_size).pow(2);
+        let img_seq_len = num_patches + 1;
+
+        let max_vision_attn = {
+            // do_image_splitting = true
+            let images_factor = 5;
+
+            (max_batch_size * images_factor * max_num_images)
+                * cfg.vision_config.num_attention_heads
+                * img_seq_len
+                * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -716,6 +841,76 @@ impl IsqModelLoader for LLaVANextLoader {
 }
 
 impl DeviceMappedModelLoader for LLaVANextLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: LLaVAConfig = serde_json::from_str(config)?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let img_seq_len =
+            llava_next_inputs_processor::LLaVANextInputProcessor::get_num_image_tokens(
+                &config,
+                (max_image_shape.0 as u32, max_image_shape.1 as u32),
+            );
+        let img_seq_len = img_seq_len * max_num_images;
+
+        let max_text_attn = {
+            let cfg = &config.text_config;
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: LLaVAConfig = serde_json::from_str(config)?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let img_seq_len =
+            llava_next_inputs_processor::LLaVANextInputProcessor::get_num_image_tokens(
+                &config,
+                (max_image_shape.0 as u32, max_image_shape.1 as u32),
+            );
+
+        let max_vision_attn = {
+            (max_batch_size * max_num_images)
+                * config.vision_config.num_attention_heads
+                * img_seq_len
+                * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -876,6 +1071,68 @@ impl IsqModelLoader for LLaVALoader {
 }
 
 impl DeviceMappedModelLoader for LLaVALoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: LLaVAConfig = serde_json::from_str(config)?;
+
+        let img_seq_len =
+            llava_inputs_processor::LLaVAInputProcessor::get_num_image_tokens(&config);
+        let img_seq_len = img_seq_len * max_num_images;
+
+        let max_text_attn = {
+            let cfg = &config.text_config;
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: LLaVAConfig = serde_json::from_str(config)?;
+
+        let img_seq_len =
+            llava_inputs_processor::LLaVAInputProcessor::get_num_image_tokens(&config);
+
+        let max_vision_attn = {
+            (max_batch_size * max_num_images)
+                * config.vision_config.num_attention_heads
+                * img_seq_len
+                * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -1089,6 +1346,75 @@ impl IsqModelLoader for VLlamaLoader {
 }
 
 impl DeviceMappedModelLoader for VLlamaLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: MLlamaConfig = serde_json::from_str(config)?;
+
+        let img_seq_len = {
+            let cfg = &config.vision_config;
+            let num_patches = (cfg.image_size / cfg.patch_size).pow(2) + 1;
+            let num_padding_patches = (8 - (num_patches as isize % 8)) % 8;
+            cfg.max_num_tiles * (num_patches as isize + num_padding_patches) as usize
+        };
+        let img_seq_len = img_seq_len * max_num_images;
+
+        let max_cross_text_attn = {
+            let cfg = &config.text_config;
+            max_batch_size * cfg.num_attention_heads * img_seq_len * img_seq_len
+        };
+
+        let max_self_text_attn = {
+            let cfg = &config.text_config;
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_self_text_attn.max(max_cross_text_attn))
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let config: MLlamaConfig = serde_json::from_str(config)?;
+
+        let img_seq_len = {
+            let cfg = &config.vision_config;
+            let num_patches = (cfg.image_size / cfg.patch_size).pow(2) + 1;
+            let num_padding_patches = (8 - (num_patches as isize % 8)) % 8;
+            cfg.max_num_tiles * (num_patches as isize + num_padding_patches) as usize
+        };
+        let max_vision_attn = {
+            let cfg = &config.vision_config;
+            (max_batch_size * max_num_images) * cfg.num_attention_heads * img_seq_len * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -1326,6 +1652,74 @@ impl IsqModelLoader for Qwen2VLLoader {
 }
 
 impl DeviceMappedModelLoader for Qwen2VLLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen2VLConfig = serde_json::from_str(config)?;
+
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            let grid_t = max_num_images / cfg.temporal_patch_size;
+            let grid_h = max_image_shape.0 / cfg.patch_size;
+            let grid_w = max_image_shape.1 / cfg.patch_size;
+            grid_t * grid_h * grid_w
+        };
+        let img_seq_len = img_seq_len * max_num_images;
+
+        let max_text_attn = {
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen2VLConfig = serde_json::from_str(config)?;
+
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            let grid_t = max_num_images / cfg.temporal_patch_size;
+            let grid_h = max_image_shape.0 / cfg.patch_size;
+            let grid_w = max_image_shape.1 / cfg.patch_size;
+            grid_t * grid_h * grid_w
+        };
+
+        let max_vision_attn = {
+            let cfg = &cfg.vision_config;
+            (max_batch_size * max_num_images) * cfg.num_heads * img_seq_len * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
@@ -1525,6 +1919,68 @@ impl IsqModelLoader for Idefics3Loader {
 }
 
 impl DeviceMappedModelLoader for Idefics3Loader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Idefics2Config = serde_json::from_str(config)?;
+
+        let num_patches = (cfg.vision_config.image_size / cfg.vision_config.patch_size).pow(2);
+        let img_seq_len = (num_patches + 1) * max_num_images;
+
+        let max_text_attn = {
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len;
+            max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape: _,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Idefics2Config = serde_json::from_str(config)?;
+
+        let num_patches = (cfg.vision_config.image_size / cfg.vision_config.patch_size).pow(2);
+        let img_seq_len = num_patches + 1;
+
+        let max_vision_attn = {
+            // do_image_splitting = true
+            let images_factor = 5;
+
+            (max_batch_size * images_factor * max_num_images)
+                * cfg.vision_config.num_attention_heads
+                * img_seq_len
+                * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,

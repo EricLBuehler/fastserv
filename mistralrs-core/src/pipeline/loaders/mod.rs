@@ -4,7 +4,7 @@ mod vision_loaders;
 
 use std::{
     collections::HashMap,
-    fmt::{self, Debug},
+    fmt::{self, Debug, Display},
     path::PathBuf,
     str::FromStr,
     sync::Arc,
@@ -357,13 +357,98 @@ impl ModelKind {
     }
 }
 
+macro_rules! b_to_mb {
+    ($x:expr) => {
+        $x / (1024 * 1024)
+    };
+}
+
+#[derive(Debug, Clone)]
+pub enum AutoDeviceMapParams {
+    Text {
+        max_seq_len: usize,
+        max_batch_size: usize,
+    },
+    Vision {
+        max_seq_len: usize,
+        max_batch_size: usize,
+        max_image_shape: (usize, usize),
+        max_num_images: usize,
+    },
+}
+
+impl Display for AutoDeviceMapParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text {
+                max_seq_len,
+                max_batch_size,
+            } => write!(
+                f,
+                "text[max_seq_len: {max_seq_len}, max_batch_size: {max_batch_size}]"
+            ),
+            Self::Vision {
+                max_seq_len,
+                max_batch_size,
+                max_image_shape,
+                max_num_images
+            } => write!(
+                f,
+                "vision[max_seq_len: {max_seq_len}, max_batch_size: {max_batch_size}, max_image_shape: {max_image_shape:?}, max_num_images: {max_num_images}]"
+            ),
+        }
+    }
+}
+
+impl AutoDeviceMapParams {
+    pub const DEFAULT_MAX_SEQ_LEN: usize = 16 * 1024;
+    pub const DEFAULT_MAX_BATCH_SIZE: usize = 1;
+    pub const DEFAULT_MAX_NUM_IMAGES: usize = 1;
+    pub const DEFAULT_MAX_IMAGE_LENGTH: usize = 2 * 1024;
+
+    pub fn default_text() -> Self {
+        Self::Text {
+            max_seq_len: Self::DEFAULT_MAX_SEQ_LEN,
+            max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
+        }
+    }
+
+    pub fn default_vision() -> Self {
+        Self::Vision {
+            max_seq_len: Self::DEFAULT_MAX_SEQ_LEN,
+            max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
+            max_num_images: Self::DEFAULT_MAX_NUM_IMAGES,
+            max_image_shape: (
+                Self::DEFAULT_MAX_IMAGE_LENGTH,
+                Self::DEFAULT_MAX_IMAGE_LENGTH,
+            ),
+        }
+    }
+}
+
 pub trait DeviceMappedModelLoader {
+    /// Maximum activation size of non-mapped parts of this model.
+    /// Useful for the vision models which may prefer to keep the vison components on the GPU.
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize>;
+    /// Maximum activation size of mapped parts of the model
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize>;
+
+    /// weight_pack_factor only applies to quantized weights.
     fn non_mapped_size_in_bytes(
         &self,
         config: &str,
         dtype: DType,
         weight_pack_factor: usize,
     ) -> Result<usize>;
+    /// weight_pack_factor only applies to quantized weights.
     fn layer_sizes_in_bytes(
         &self,
         config: &str,
@@ -372,16 +457,23 @@ pub trait DeviceMappedModelLoader {
     ) -> Result<Vec<usize>>;
     fn num_layers(&self, config: &str) -> Result<usize>;
 
-    /// weight_pack_factor only applies to quantized weights.
+    #[allow(clippy::too_many_arguments)]
     fn get_device_layers(
         &self,
-        _config: &str,
+        config: &str,
         num_layers: usize,
         mut layer_sizes_in_bytes: Vec<usize>,
         non_mapped_size_in_bytes: usize,
         total_model_size_in_bytes: usize,
         devices: &[Device],
+        dtype: DType,
+        params: &AutoDeviceMapParams,
     ) -> Result<DeviceMapMetadata> {
+        let mapped_max_act_size_in_bytes =
+            self.mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
+        let non_mapped_max_act_size_in_bytes =
+            self.non_mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
+
         let mut remaining_to_map = total_model_size_in_bytes;
 
         // Always add the CPU as fallback
@@ -410,7 +502,25 @@ pub trait DeviceMappedModelLoader {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             let device_capacity = (device_capacity as f64 * 0.90) as usize;
 
-            let layers_on_device = if device_capacity >= remaining_to_map {
+            // Algorithm is to check the following:
+            // 1) (no mapping) if *everything* fits on the first dev (non mapped and mapped)
+            // 2) if the mapped activations plus remaining fits on the nth device
+            // 3) common case, iteratively find the optimal amount of layers to put on the nth device
+            //   - if this is the first dev: must hold the non-mapped act and non-mapped model
+            //   - otherwise, must hold the mapped act
+            #[allow(clippy::if_same_then_else)]
+            let layers_on_device = if current_ordinal == 0
+                && device_capacity
+                    >= remaining_to_map
+                        + non_mapped_max_act_size_in_bytes
+                        + mapped_max_act_size_in_bytes
+            {
+                remaining_to_map = 0;
+
+                num_layers - current_layer
+            } else if current_ordinal != 0
+                && device_capacity >= remaining_to_map + mapped_max_act_size_in_bytes
+            {
                 remaining_to_map = 0;
 
                 num_layers - current_layer
@@ -419,7 +529,9 @@ pub trait DeviceMappedModelLoader {
                 let mut layers_on_device = 0;
 
                 if current_ordinal == 0 {
-                    used_capacity += non_mapped_size_in_bytes;
+                    used_capacity += non_mapped_size_in_bytes + non_mapped_max_act_size_in_bytes;
+                } else {
+                    used_capacity += mapped_max_act_size_in_bytes;
                 }
 
                 while let Some(&last) = layer_sizes_in_bytes.last() {
@@ -430,7 +542,10 @@ pub trait DeviceMappedModelLoader {
                     layers_on_device += 1;
                 }
 
-                remaining_to_map = remaining_to_map.saturating_sub(used_capacity);
+                // Do not reduce amount to map if this device can't fit any
+                if layers_on_device > 0 {
+                    remaining_to_map = remaining_to_map.saturating_sub(used_capacity);
+                }
                 layers_on_device
             };
 
@@ -447,7 +562,7 @@ pub trait DeviceMappedModelLoader {
         }
         if remaining_to_map > 0 {
             anyhow::bail!(
-                "This model does not fit on the devices {:?}, and exceeds total capacity by {}MB",
+                "This model does not fit on the devices {:?}, and exceeds total capacity by {}MB. Auto device mapping params: {params}",
                 per_layer_avail
                     .iter()
                     .rev()
@@ -457,7 +572,7 @@ pub trait DeviceMappedModelLoader {
                         avail / (1024 * 1024),
                     ))
                     .collect::<Vec<_>>(),
-                remaining_to_map / (1024 * 1024)
+                b_to_mb!(remaining_to_map)
             );
         }
 
@@ -470,7 +585,7 @@ pub trait DeviceMappedModelLoader {
 ///
 /// # Example
 /// ```no_run
-/// use mistralrs_core::{Loader, TokenSource, DeviceMapSetting, ModelDType};
+/// use mistralrs_core::{Loader, TokenSource, DeviceMapSetting, AutoDeviceMapParams, ModelDType};
 /// use candle_core::Device;
 ///
 /// let loader: Box<dyn Loader> = todo!();
@@ -480,7 +595,7 @@ pub trait DeviceMappedModelLoader {
 ///     &ModelDType::Auto,
 ///     &Device::cuda_if_available(0).unwrap(),
 ///     false,
-///     DeviceMapSetting::Auto,
+///     DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
 ///     None,
 ///     None,
 /// ).unwrap();
