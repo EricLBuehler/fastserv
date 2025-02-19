@@ -18,7 +18,7 @@ use super::{
     Qwen2Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
-use crate::device_map::{self, DeviceMapper};
+use crate::device_map::DeviceMapper;
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
@@ -296,13 +296,18 @@ impl Loader for NormalLoader {
 
         info!("Prompt chunk size is {prompt_chunksize}.",);
 
-        let available_devices = device_map::get_all_similar_devices(device)?;
+        // let mut available_devices = device_map::get_all_similar_devices(device)?;
+        let available_devices = vec![candle_core::Device::new_cuda(
+            env::var("MISTRALRS_MN_WORKER_ID")
+                .map(|x| usize::from_str(&x).unwrap() + 1)
+                .unwrap_or(0),
+        )?];
 
-        let use_nccl = available_devices.iter().all(|dev| dev.is_cuda())
+        let use_nccl = (available_devices.iter().all(|dev| dev.is_cuda())
             && available_devices.len() > 1
             && (std::env::var("MISTRALRS_NO_NCCL").is_err()
-                || std::env::var("MISTRALRS_NO_NCCL").is_ok_and(|x| x != "1"))
-            && cfg!(feature = "nccl");
+                || std::env::var("MISTRALRS_NO_NCCL").is_ok_and(|x| x != "1")))
+            || cfg!(feature = "nccl");
 
         // If auto, convert to Map if not using nccl
         if use_nccl {
@@ -483,7 +488,8 @@ impl Loader for NormalLoader {
                 anyhow::bail!("MISTRALRS_PIPELINE_PARALLEL must be nonzero")
             }
 
-            let local_world_size = available_devices.len() / pipeline_parallel_size;
+            // let local_world_size = available_devices.len() / pipeline_parallel_size;
+            let local_world_size = 1;
             let global_world_size = if let Ok(x) = std::env::var("MISTRALRS_MN_GLOBAL_WORLD_SIZE") {
                 usize::from_str(&x).context("MISTRALRS_MN_GLOBAL_WORLD_SIZE")?
             } else {
@@ -540,18 +546,6 @@ impl Loader for NormalLoader {
                 }
             }
 
-            if available_devices.len() % ids.len() != 0 {
-                anyhow::bail!(
-                    "Pipeline parallel size {} must divide the number of available devices {}",
-                    pipeline_parallel_size,
-                    available_devices.len()
-                );
-            }
-
-            let split_available_devices = available_devices
-                .chunks(available_devices.len() / pipeline_parallel_size)
-                .collect::<Vec<_>>();
-
             let rank_offset = if env::var("MISTRALRS_MN_WORKER_SERVER_ADDR").is_ok() {
                 let Ok(node_id) = env::var("MISTRALRS_MN_WORKER_ID") else {
                     anyhow::bail!(
@@ -564,6 +558,18 @@ impl Loader for NormalLoader {
             } else {
                 0
             };
+
+            if available_devices.len() % ids.len() != 0 {
+                anyhow::bail!(
+                    "Pipeline parallel size {} must divide the number of available devices {}",
+                    pipeline_parallel_size,
+                    available_devices.len()
+                );
+            }
+
+            let split_available_devices = available_devices
+                .chunks(available_devices.len() / pipeline_parallel_size)
+                .collect::<Vec<_>>();
 
             // Transpose
             let mut comms_all = Vec::new();
