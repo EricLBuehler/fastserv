@@ -18,7 +18,8 @@ use super::{
     Qwen2Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
-use crate::device_map::{self, DeviceMapper};
+use crate::daemon::{self, BigI8Array, WorkerTransferData};
+use crate::device_map::DeviceMapper;
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
@@ -42,7 +43,11 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor, Var};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::MultiProgress;
-use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType, ShardedSafeTensors};
+use interprocess::local_socket::traits::{Listener, Stream};
+use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
+use mistralrs_quant::{
+    BarrierLike, GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType, ShardedSafeTensors,
+};
 use rand_isaac::Isaac64Rng;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
@@ -51,8 +56,10 @@ use rayon::iter::{
 use regex_automata::meta::Regex;
 use std::any::Any;
 use std::borrow::Cow;
+use std::io::{BufRead, BufReader, Write};
 use std::num::{NonZero, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Barrier, RwLock};
 use std::time::Instant;
@@ -60,6 +67,8 @@ use std::{env, fs};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+const FLAG: &str = "__MISTRALRS_WORKER_INTERNAL";
 
 pub struct NormalPipeline {
     parallel_models: Vec<Arc<dyn NormalModel + Send + Sync>>,
@@ -78,6 +87,7 @@ pub struct NormalPipeline {
     config: String,
     imatrix: Option<PathBuf>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    forward_barrier: Box<dyn BarrierLike>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -296,13 +306,19 @@ impl Loader for NormalLoader {
 
         info!("Prompt chunk size is {prompt_chunksize}.",);
 
-        let available_devices = device_map::get_all_similar_devices(device)?;
+        // let available_devices = device_map::get_all_similar_devices(device)?;
+        let available_devices = vec![candle_core::Device::new_cuda(
+            env::var("MISTRALRS_MN_WORKER_ID")
+                .map(|x| usize::from_str(&x).unwrap() + 1)
+                .unwrap_or(0),
+        )?];
 
         let use_nccl = available_devices.iter().all(|dev| dev.is_cuda())
             && available_devices.len() > 1
             && (std::env::var("MISTRALRS_NO_NCCL").is_err()
                 || std::env::var("MISTRALRS_NO_NCCL").is_ok_and(|x| x != "1"))
             && cfg!(feature = "nccl");
+        let use_nccl = true;
 
         // If auto, convert to Map if not using nccl
         if use_nccl {
@@ -499,6 +515,8 @@ impl Loader for NormalLoader {
                 anyhow::bail!("Global world size {global_world_size} must both be at least and divide the local world size {local_world_size}");
             }
 
+            let global_world_size = 8;
+
             info!("Local tensor parallel world size is {local_world_size}");
             info!("Global tensor parallel world size is {global_world_size}");
             info!("Pipeline parallelism size is {pipeline_parallel_size}");
@@ -506,6 +524,79 @@ impl Loader for NormalLoader {
             let mut ids = (0..pipeline_parallel_size)
                 .map(|_| mistralrs_quant::Id::new())
                 .collect::<Vec<_>>();
+
+            // TODO!!!
+            assert_eq!(pipeline_parallel_size, 1);
+
+            let name = daemon::ipc_name()?;
+            let local_rank = if let Ok(payload) = env::var(FLAG) {
+                let payload: WorkerTransferData = serde_json::from_str(&payload)?;
+                let WorkerTransferData::Init {
+                    ids: new_ids,
+                    worker_rank,
+                } = payload
+                else {
+                    anyhow::bail!("Should only be getting an Init...")
+                };
+                ids = new_ids
+                    .into_iter()
+                    .map(|x| mistralrs_quant::Id::uninit(x.0))
+                    .collect();
+
+                let mut stream = LocalStream::connect(name)?;
+                stream.write_all(b"ready\n")?;
+                worker_rank + 1
+            } else {
+                let num_workers = 7;
+                let mut children = Vec::new();
+                for worker_rank in 0..num_workers {
+                    dbg!(&worker_rank);
+                    let exe_path = env::current_exe().expect("Failed to get current exe");
+
+                    let args: Vec<String> = env::args().collect();
+
+                    let mut cmd = Command::new(exe_path);
+                    cmd.args(&args[1..]);
+
+                    let data = WorkerTransferData::Init {
+                        ids: ids
+                            .iter()
+                            .map(|id| id.internal().to_owned())
+                            .map(BigI8Array)
+                            .collect(),
+                        worker_rank,
+                    };
+
+                    cmd.env(FLAG, serde_json::to_string(&data)?);
+                    cmd.env("MISTRALRS_MN_WORKER_ID", worker_rank.to_string());
+
+                    cmd.stdout(std::process::Stdio::null());
+                    // cmd.stderr(std::process::Stdio::null());
+                    cmd.stdin(std::process::Stdio::null());
+
+                    children.push(cmd.spawn().expect("Failed to spawn process"));
+                }
+
+                let listener = ListenerOptions::new().name(name).create_sync()?;
+                let mut ready_count = 0;
+
+                while ready_count < num_workers {
+                    let stream = listener.accept()?;
+                    let mut reader = BufReader::new(stream);
+                    let mut message = String::new();
+                    reader.read_line(&mut message)?;
+                    if message.trim() == "ready" {
+                        ready_count += 1;
+                    }
+                }
+                info!("All workers have received the ids!");
+
+                0
+            };
+            // TODO!!!
+            // let available_devices = vec![available_devices[local_rank].clone()];
+            // dbg!(ids.iter().map(|id| id.internal()).collect::<Vec<_>>());
+            dbg!(&available_devices);
 
             if ids.len() != 1 && use_multi_node {
                 anyhow::bail!(
@@ -565,33 +656,45 @@ impl Loader for NormalLoader {
                 0
             };
 
+            let rank_offset = local_rank;
+            let local_world_size = 1;
+
             // Transpose
             let mut comms_all = Vec::new();
             for (pipeline_parallel_i, devices_per_pipeline_parallel) in
                 split_available_devices.iter().enumerate()
             {
                 // Each pipeline parallel gets its own barrier
-                let barrier = if let Ok(n_nodes) = env::var("MISTRALRS_MN_HEAD_NUM_WORKERS") {
-                    let n_nodes =
-                        usize::from_str(&n_nodes).context("MISTRALRS_MN_HEAD_NUM_WORKERS")?;
-                    let Ok(port) = env::var("MISTRALRS_MN_HEAD_PORT") else {
-                        anyhow::bail!(
-                            "Got MISTRALRS_MN_HEAD_NUM_WORKERS, expected MISTRALRS_MN_HEAD_PORT"
-                        );
-                    };
-                    let server = mistralrs_quant::Server::new(
-                        &format!("0.0.0.0:{port}"),
-                        n_nodes,
-                        local_world_size,
-                    )?;
+                // let barrier = if let Ok(n_nodes) = env::var("MISTRALRS_MN_HEAD_NUM_WORKERS") {
+                //     let n_nodes =
+                //         usize::from_str(&n_nodes).context("MISTRALRS_MN_HEAD_NUM_WORKERS")?;
+                //     let Ok(port) = env::var("MISTRALRS_MN_HEAD_PORT") else {
+                //         anyhow::bail!(
+                //             "Got MISTRALRS_MN_HEAD_NUM_WORKERS, expected MISTRALRS_MN_HEAD_PORT"
+                //         );
+                //     };
+                //     let server = mistralrs_quant::Server::new(
+                //         &format!("0.0.0.0:{port}"),
+                //         n_nodes,
+                //         local_world_size,
+                //     )?;
 
-                    Arc::new(server) as Arc<dyn mistralrs_quant::BarrierLike>
-                } else if let Ok(addr) = env::var("MISTRALRS_MN_WORKER_SERVER_ADDR") {
-                    let client = mistralrs_quant::Client::new(addr.parse()?, local_world_size)?;
-                    Arc::new(client) as Arc<dyn mistralrs_quant::BarrierLike>
+                //     Arc::new(server) as Arc<dyn mistralrs_quant::BarrierLike>
+                // } else if let Ok(addr) = env::var("MISTRALRS_MN_WORKER_SERVER_ADDR") {
+                //     let client = mistralrs_quant::Client::new(addr.parse()?, local_world_size)?;
+                //     Arc::new(client) as Arc<dyn mistralrs_quant::BarrierLike>
+                // } else {
+                //     Arc::new(Barrier::new(local_world_size))
+                //         as Arc<dyn mistralrs_quant::BarrierLike>
+                // };
+                let barrier = if env::var(daemon::FLAG).is_err() {
+                    Arc::new(mistralrs_quant::Server::new(&"0.0.0.0:8700", 7, 1)?)
+                        as Arc<dyn BarrierLike>
                 } else {
-                    Arc::new(Barrier::new(local_world_size))
-                        as Arc<dyn mistralrs_quant::BarrierLike>
+                    Arc::new(mistralrs_quant::Client::new(
+                        "0.0.0.0:8700".parse().unwrap(),
+                        1,
+                    )?) as Arc<dyn BarrierLike>
                 };
 
                 // They each block on each other
@@ -1005,6 +1108,16 @@ impl Loader for NormalLoader {
             .into_iter()
             .map(Arc::from)
             .collect::<Vec<_>>();
+
+        let barrier = if env::var(daemon::FLAG).is_err() {
+            Box::new(mistralrs_quant::Server::new(&"0.0.0.0:8765", 7, 1)?) as Box<dyn BarrierLike>
+        } else {
+            Box::new(mistralrs_quant::Client::new(
+                "0.0.0.0:8765".parse().unwrap(),
+                1,
+            )?) as Box<dyn BarrierLike>
+        };
+
         Ok(Arc::new(Mutex::new(NormalPipeline {
             parallel_models,
             tokenizer: tokenizer.into(),
@@ -1041,6 +1154,7 @@ impl Loader for NormalLoader {
             config,
             imatrix: self.config.imatrix.clone(),
             mapper: pipeline_mapper,
+            forward_barrier: barrier,
         })))
     }
 
@@ -1221,6 +1335,8 @@ impl Pipeline for NormalPipeline {
             }
             (None, None) => None,
         };
+        // Synchronize on forward pass
+        self.forward_barrier.wait()?;
         #[cfg(feature = "metal")]
         let logits = objc::rc::autoreleasepool(|| -> candle_core::Result<Tensor> {
             match self.parallel_models[0].is_xlora() {

@@ -8,6 +8,9 @@ pub use pipeline::ModelCategory;
 pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
+use std::env;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::time::Instant;
 use std::{
     cell::RefCell,
@@ -53,6 +56,7 @@ mod paged_attention;
 #[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
 use dummy_paged_attention as paged_attention;
 mod attention;
+pub(crate) mod daemon;
 mod diffusion_models;
 mod pipeline;
 mod prefix_cacher;
@@ -370,52 +374,81 @@ impl MistralRs {
         let engine_id = ENGINE_ID.fetch_add(1, atomic::Ordering::SeqCst);
 
         // Determine if the current runtime is multi-threaded, as blocking operations are not allowed in single-threaded mode
-        let is_multi_threaded = tokio::runtime::Handle::try_current()
-            .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
+        // let is_multi_threaded = tokio::runtime::Handle::try_current()
+        //     .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
 
-        // Do a dummy run
-        if is_multi_threaded
-            && matches!(category, ModelCategory::Text | ModelCategory::Vision { .. })
-        {
-            let clone_sender = sender.read().unwrap().clone();
-            tokio::task::block_in_place(|| {
-                let (tx, mut rx) = channel(1);
-                let req = Request::Normal(NormalRequest {
-                    id: 0,
-                    messages: RequestMessage::Completion {
-                        text: "dummy".to_string(),
-                        echo_prompt: false,
-                        best_of: None,
-                    },
-                    sampling_params: SamplingParams {
-                        max_len: Some(1),
-                        ..SamplingParams::deterministic()
-                    },
-                    response: tx,
-                    return_logprobs: false,
-                    is_streaming: true,
-                    constraint: Constraint::None,
-                    suffix: None,
-                    adapters: None,
-                    tool_choice: None,
-                    tools: None,
-                    logits_processors: None,
-                    return_raw_logits: false,
+        // // Do a dummy run
+        // if is_multi_threaded
+        //     && matches!(category, ModelCategory::Text | ModelCategory::Vision { .. })
+        // {
+        //     let clone_sender = sender.read().unwrap().clone();
+        //     tokio::task::block_in_place(|| {
+        //         let (tx, mut rx) = channel(1);
+        //         let req = Request::Normal(NormalRequest {
+        //             id: 0,
+        //             messages: RequestMessage::Completion {
+        //                 text: "hello".to_string(),
+        //                 echo_prompt: false,
+        //                 best_of: None,
+        //             },
+        //             sampling_params: SamplingParams {
+        //                 max_len: Some(1),
+        //                 ..SamplingParams::deterministic()
+        //             },
+        //             response: tx,
+        //             return_logprobs: false,
+        //             is_streaming: false,
+        //             constraint: Constraint::None,
+        //             suffix: None,
+        //             adapters: None,
+        //             tool_choice: None,
+        //             tools: None,
+        //             logits_processors: None,
+        //             return_raw_logits: false,
+        //         });
+        //         info!("Beginning dummy run.");
+        //         let start = Instant::now();
+        //         clone_sender.blocking_send(req).unwrap();
+
+        //         if let Some(_resp) = rx.blocking_recv() {
+        //             let end = Instant::now();
+        //             info!(
+        //                 "Dummy run completed in {}s.",
+        //                 end.duration_since(start).as_secs_f64()
+        //             );
+        //         } else {
+        //             warn!("Dummy run failed!");
+        //         }
+        //     });
+        // }
+
+        if env::var(daemon::FLAG).is_ok() {
+            thread::spawn(move || {
+                let rt = Runtime::new().unwrap();
+                rt.block_on(async move {
+                    use interprocess::local_socket::traits::Stream;
+                    use interprocess::local_socket::Stream as LocalStream;
+
+                    let request_sender = sender.write().unwrap();
+                    loop {
+                        let name = daemon::ipc_name().unwrap();
+                        if let Ok(stream) = LocalStream::connect(name) {
+                            let mut reader = BufReader::new(stream);
+                            let mut buf = String::new();
+                            reader.read_line(&mut buf).unwrap();
+                            let mut req: NormalRequest = serde_json::from_str(&buf).unwrap();
+                            req.is_streaming = false;
+
+                            let mut receiver =
+                                request::DEFAULT_RECEIVER.get().unwrap().lock().unwrap();
+                            request_sender.send(Request::Normal(req)).await.unwrap();
+                            let resp = receiver.recv().await.unwrap();
+                            assert!(resp.as_result().is_ok());
+                        }
+                    }
                 });
-                info!("Beginning dummy run.");
-                let start = Instant::now();
-                clone_sender.blocking_send(req).unwrap();
-
-                if let Some(_resp) = rx.blocking_recv() {
-                    let end = Instant::now();
-                    info!(
-                        "Dummy run completed in {}s.",
-                        end.duration_since(start).as_secs_f64()
-                    );
-                } else {
-                    warn!("Dummy run failed!");
-                }
             });
+            loop {}
         }
 
         Arc::new(Self {
